@@ -1,0 +1,282 @@
+<?php
+
+/**
+ * Ajax Image Upload for Processwire
+ *
+ * ProcessWire 2.x
+ * License: MIT
+ *
+ */
+
+class AjaxImageUpload extends WireData implements Module
+{
+
+    public static function getModuleInfo()
+    {
+
+        return array(
+            'title' => 'Ajax Image Upload',
+            'version' => 001,
+            'summary' => 'Provides Ajax Image Upload capabilities.',
+            'href' => 'http://github.com/bytebus/AjaxImageUpload',
+            'singular' => true,
+            'autoload' => true,
+            'requires' => 'FieldtypeImage',
+        );
+    }
+
+    public function __construct() {
+        $this->set('uploadDir', $this->config->paths->files . '.tmp_ajax_uploads/');
+    }
+
+    public function init()
+    {
+        /* Set defaults */
+        $this->set('urlPrefix', 'ajaxImageUpload');
+        $this->set('handlerUrl', $this->urlPrefix . '/handler.json');
+
+        $this->addHookBefore('ProcessPageView::execute', $this, 'dispatch');
+
+    }
+
+    public function dispatch($event)
+    {
+        if (!isset($_GET['it'])) {
+            return;
+        }
+        switch ($_GET['it']) {
+            case $this->handlerUrl:
+                $this->handleUpload($event);
+                break;
+        }
+    }
+
+    public function handleUpload($event) {
+        /* Prepare response */
+        $response = new stdClass();
+        $response->errors = array();
+        $response->files = array();
+        $response->pageName = '';
+
+        if (!$this->input->post->field) {
+            $response->errors[] = $this->_('Upload field name name not specified.');
+        } else {
+            $u = new WireUpload($this->input->post->field);
+            $u->setMaxFiles(1);
+            $u->setMaxFileSize(4*1024*1024);
+            $u->setOverwrite(false);
+            $u->setDestinationPath($this->uploadDir);
+            $u->setValidExtensions(array('jpg', 'jpeg', 'gif', 'png'));
+
+            // execute upload and check for errors
+            $files = $u->execute();
+            $errors = $u->getErrors();
+
+            if (0 < count($errors)) {
+                foreach ($errors as $error) {
+                    $response->errors[] = $error;
+                }
+            } else {
+                /* Generate unique page name */
+                $pageName = uniqid() . '_' . md5(implode('|', $files));
+                $uploadPage = new Page();
+                ///*
+                $uploadPage->template = 'ajax_image_upload';
+                $uploadPage->title = $pageName;
+                $uploadPage->parent = $this->pages->get('name=ajax_image_upload_list');
+                $uploadPage->save();
+
+                // add images upload
+                foreach($files as $filename) {
+                    $uploadPage->ajax_image_upload_image = $this->uploadDir . $filename;
+                }
+
+                // save page
+                $uploadPage->save();
+
+                /* Buidl response */
+                $response->pageName = $pageName;
+                foreach ($uploadPage->ajax_image_upload_image as $img) {
+                    $response->files[] = $img->url;
+                }
+
+                // remove all tmp files uploaded
+                foreach($files as $filename) {
+                    unlink($this->uploadDir . $filename);
+                }
+            }
+        }
+        header('Content-type: application/json');
+        $event->replace = true;
+        $event->return = json_encode($response);
+    }
+
+    public function addScripts($addBefore = false) {
+        $scripts = array(
+            'vendor/jqueryui.widget.js',
+            'jquery.iframe-support.js',
+            'jquery.fileupload.js'
+
+        );
+        foreach ($scripts as $script) {
+            $this->config->scripts->{$addBefore ? 'prepend' : 'append'}(
+                $this->config->urls->siteModules
+                . 'AjaxImageUpload/vendor/jQuery-File-Upload/js/'
+                . $script
+            );
+        }
+    }
+
+    public function transferImages($sourcePage, $targetPage, $fieldName, $deleteSourcePage = true) {
+        if (!$sourcePage
+            || $sourcePage instanceof NullPage
+            || !$targetPage
+            || $targetPage instanceof NullPage
+            || !$targetPage->{$fieldName} instanceof Pageimages) {
+            return false;
+        }
+        foreach ($sourcePage->ajax_image_upload_image as $img) {
+            $targetPage->{$fieldName} = $img->filename();
+        }
+        if ($deleteSourcePage) {
+            $this->pages->delete($sourcePage);
+        }
+        return $targetPage;
+    }
+
+    public function ___install()
+    {
+        $listPage = $this->pages->get('name=ajax_image_upload_list');
+        if ($listPage && !($listPage instanceof NullPage)) {
+            throw new WireException($this->_(
+                'A page with the name "ajax_image_upload_list" already exists. Please rename or remove it before you install this module.'
+            ));
+        }
+
+        if ($this->templates->get('ajax_image_upload_list')) {
+            throw new WireException($this->_(
+                'A template with the name "ajax_image_upload_list" already exists. Please rename or remove it before you install this module.'
+            ));
+        }
+        if ($this->templates->get('ajax_image_upload')) {
+            throw new WireException($this->_(
+                'A template with the name "ajax_image_upload" already exists. Please rename or remove it before you install this module.'
+            ));
+        }
+        if ($this->fieldgroups->get('ajax_image_upload')) {
+            throw new WireException($this->_(
+                'A fieldgroup with the name "ajax_image_upload" already exists. Please rename or remove it before you install this module.'
+            ));
+        }
+        if ($this->fields->get('ajax_image_upload_image')) {
+            throw new WireException($this->_(
+                'A field with the name "ajax_image_upload_image" already exists. Please rename or remove it before you install this module.'
+            ));
+        }
+
+        $imageField = new Field();
+        $imageField->type = $this->modules->get('FieldtypeImage');
+        $imageField->name = 'ajax_image_upload_image';
+        $imageField->flags = Field::flagSystem;
+        $imageField->save();
+
+        $fieldGroup = new Fieldgroup();
+        $fieldGroup->name = 'ajax_image_upload';
+        $fieldGroup->add($this->fields->get('title')); // mandatory title field
+        $fieldGroup->add($imageField);
+        $fieldGroup->save();
+
+        $imagePageTemplate = new Template();
+        $imagePageTemplate->name = 'ajax_image_upload';
+        $imagePageTemplate->fieldgroup = $fieldGroup;
+        $imagePageTemplate->noChildren = 1;
+        $imagePageTemplate->flags = Template::flagSystem;
+        $imagePageTemplate->save();
+
+        $fieldGroup = new Fieldgroup();
+        $fieldGroup->name = 'ajax_image_upload_list';
+        $fieldGroup->add($this->fields->get('title')); // mandatory title field
+        $fieldGroup->save();
+
+        $listPageTemplate = new Template();
+        $listPageTemplate->name = 'ajax_image_upload_list';
+        $listPageTemplate->fieldgroup = $fieldGroup;
+        $listPageTemplate->childTemplates = array($imagePageTemplate->id);
+        $listPageTemplate->flags = Template::flagSystem;
+        $listPageTemplate->save();
+
+        $imagePageTemplate->parentTemplates = array($listPageTemplate->id);
+        $imagePageTemplate->save();
+
+        $rootPage = $this->pages->get($this->config->urls->root);
+        $listPage = new Page();
+        $listPage->parent = $rootPage;
+        $listPage->template = $listPageTemplate;
+        $listPage->name = 'ajax_image_upload_list';
+        $listPage->title = 'Ajax Image Upload';
+        $listPage->status = Page::statusSystem
+            | Page::statusHidden
+            | Page::statusLocked;
+        $listPage->save();
+
+        $listPageTemplate->noParents = 1;
+        $listPageTemplate->save();
+
+        /* Create folder for uploads */
+        if (!file_exists($this->uploadDir)) {
+            mkdir($this->uploadDir, $this->config->chmodDir, true);
+        }
+    }
+
+    public function ___uninstall()
+    {
+        /* Delete all image upload pages */
+        $imagePages = $this->pages->find('template.name=ajax_image_upload, include=all');
+        if (0 < $imagePages->count()) {
+            foreach ($imagePages as $imagePage) {
+                $this->pages->delete($imagePage);
+            }
+        }
+
+        /* Delete image upload list page */
+        $listPage = $this->pages->get('name=ajax_image_upload_list');
+        if ($listPage && !($listPage instanceof NullPage)) {
+            $listPage->status = Page::statusSystemOverride;
+            $listPage->status = 0;
+            $this->pages->delete($listPage);
+        }
+
+        $listPageTemplate = $this->templates->get('ajax_image_upload_list');
+        if ($listPageTemplate) {
+            $listPageTemplate->flags = Template::flagSystemOverride;
+            $listPageTemplate->flags = 0;
+            $this->templates->delete($listPageTemplate);
+        }
+
+        $fieldGroup = $this->fieldgroups->get('ajax_image_upload_list');
+        if ($fieldGroup) {
+            $this->fieldgroups->delete($fieldGroup);
+        }
+
+        $imagePageTemplate = $this->templates->get('ajax_image_upload');
+        if ($imagePageTemplate) {
+            $imagePageTemplate->flags = Template::flagSystemOverride;
+            $imagePageTemplate->flags = 0;
+            $this->templates->delete($imagePageTemplate);
+        }
+
+        $fieldGroup = $this->fieldgroups->get('ajax_image_upload');
+        if ($fieldGroup) {
+            $this->fieldgroups->delete($fieldGroup);
+        }
+
+        // Delete image field
+        $imageField = $this->fields->get('ajax_image_upload_image');
+        if ($imageField) {
+            $imageField->flags = Field::flagSystemOverride;
+            $imageField->flags = 0;
+            $this->fields->delete($imageField);
+        }
+    }
+
+}
